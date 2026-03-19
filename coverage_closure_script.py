@@ -98,7 +98,7 @@ class GitManager:
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
-API_KEY = "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"  # REPLACE THIS with your actual key or use env var
+API_KEY = ""  # REPLACE THIS with your actual key or use env var
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MODEL = "stepfun/step-3.5-flash:free"
 
@@ -250,60 +250,35 @@ def show_diff_and_confirm(original_file, new_code):
 
 
 # --- System Prompt for Coverage Closure AI ---
-SYSTEM_PROMPT = """You are a Senior UVM Verification Engineer specializing in functional coverage closure
-for the PCIe PHY Layer OS Creator module.
+SYSTEM_PROMPT = """You are a Senior UVM Verification Engineer specializing in functional coverage closure.
+Your task is to analyze a functional coverage report for a UVM-based hardware design and evolve
+the virtual sequence stimulus to hit uncovered bins.
 
-## Domain Context
-You are working on the OS (Ordered Set) Creator block of a PCIe Gen1 Physical Layer.
-This block receives requests from the LTSSM FSM to generate ordered sets (TS1, TS2, SKP, FTS, IDLE)
-and serializes them symbol-by-symbol into a Tx OS buffer.
+## Your Role
+You will be given:
+- A specification document summarizing the DUT's intended behavior
+- The UVM transaction item defining all DUT inputs/outputs
+- The current virtual sequence (the file you must update)
+- The available base sequences and their APIs (read-only reference)
+- The subscriber's covergroup definitions (defines exactly what must be covered)
+- The current coverage report showing which bins are HIT and which are UNHIT
 
-## Your Environment
-- **UVM Testbench**: Multi-agent environment with 3 agents (global, FSM, Tx)
-- **Virtual Sequencer**: `creator_virtual_sequencer` with handles:
-  - `p_sequencer.sequencer_global_h` — drives reset/global signals
-  - `p_sequencer.sequencer_FSM_h` — drives FSM control signals (enable, OS types, symbols)
-  - `p_sequencer.sequencer_Tx_h` — drives Tx buffer signals (buffer full/empty)
-
-## Available Sequences (you may ONLY use these, do NOT create new classes):
-| Sequence Name              | Sequencer Target | Purpose |
-|----------------------------|------------------|---------|
-| `reset_sequence`           | `sequencer_global_h` | Assert/deassert reset |
-| `LIDLE_sequence`           | `sequencer_FSM_h` | Drive L_IDLE ordered set (enable=0) |
-| `TS1_sequence`             | `sequencer_FSM_h` | Full TS1 OS with PAD→Link/Lane transition |
-| `TS1_intrpt_sequence`      | `sequencer_FSM_h` | TS1 with mid-stream interrupt (enable/stateChange/resetTS) |
-| `TS2_sequence`             | `sequencer_FSM_h` | Full TS2 OS with PAD→Link/Lane transition |
-| `TS2_intrpt_sequence`      | `sequencer_FSM_h` | TS2 with mid-stream interrupt |
-| `SKP_sequence`             | `sequencer_FSM_h` | Skip ordered set (COM+3×SKP) |
-| `FTS_sequence`             | `sequencer_FSM_h` | Fast Training Sequence (COM+3×FTS) |
-| `IDLE_sequence`            | `sequencer_FSM_h` | Electrical Idle ordered set |
-| `OS_Buffer_empty_sequence` | `sequencer_Tx_h` | Buffer not full |
-| `OS_Buffer_full_sequence`  | `sequencer_Tx_h` | Buffer full (backpressure) |
-
-## Covergroup Bins to Know About
-The subscriber samples these key coverpoints:
-- `i_enable_cp`: enable / no_enable
-- `i_LTSSM_stateChange_cp`: state_change / no_state_change
-- `i_reset_TS_count_cp`: reset_TS_count / no_reset_TS_count
-- `i_OSreqNum_cp`: reqNum values 0, 1, 16, 24
-- `i_OScreatorTypes_cp`: other_OS (2'b00), TS_OS (2'b01), IDLE_OS (2'b10)
-- `i_OScreatorSymbol0-15_cp`: various symbol bins (COM, PAD, Link, Lane, SKP, FTS, etc.)
-- `i_Tx_OSbufferFull_cp`: bufferFull / bufferNotFull
-- `o_OScreator_Ack_cp`: Ack / noAck
-- `o_OScreator_Data_cp`: 12 data combination bins
-- `o_OScreator_valid_cp`: valid / invalid
-
-## Critical Rules
-1. ONLY modify the `body()` task of `creator_virtual_sequence`. Keep the class name and `pre_body()` EXACTLY as-is.
-2. NEVER define new sequence classes — only instantiate and start the ones listed above.
-3. Each sequence's `pre_body()` creates its transaction — always call `seq.start(sequencer)` (which invokes `pre_body` automatically).
-4. Use `repeat(N)` around sequence starts to control how many ordered sets are generated.
-5. To hit `i_OSreqNum_cp` bins, the reqNum field is randomized inside the sequences — run enough iterations for randomization to cover all bins.
-6. To hit interrupt-related bins (stateChange, resetTS), use `TS1_intrpt_sequence` / `TS2_intrpt_sequence`.
-7. To hit bufferFull, start `OS_Buffer_full_sequence` BEFORE FSM sequences that generate data.
-8. Always start with `reset_sequence` on `sequencer_global_h`.
-9. The output must be a complete, compilable `.svh` file — include all `include` guards, class header, pre_body, and body.
-10. Use proper SystemVerilog syntax. Do not use pseudo-code or abbreviations.
+## Universal UVM Rules
+1. ONLY modify the `body()` task inside the virtual sequence class. Do NOT change the class name,
+   constructor, `pre_body()`, or any other part of the file.
+2. NEVER define new sequence classes. Only instantiate and start the existing sequences
+   provided in the base sequence file.
+3. Use only the sequencer handles available on `p_sequencer` as shown in the current virtual sequence.
+4. Always call sequences via `seq_handle.start(p_sequencer.sequencer_X_h)` — this automatically
+   invokes `pre_body()` and creates the transaction.
+5. Use `repeat(N)` to run a sequence multiple times and increase the chance of hitting randomized bins.
+6. Where a coverpoint depends on a specific field value, use the sequence that drives that field.
+7. The output must be a complete, compilable SystemVerilog `.svh` file.
+8. Use proper SystemVerilog syntax only — no pseudocode, no comments replacing code.
+9. Study the covergroup carefully: each `coverpoint` maps to a field in the transaction item,
+   and each `bin` maps to a specific value that field must take for the bin to be hit.
+10. If a bin requires a corner-case stimulus (e.g. backpressure, state transitions, interrupts),
+    look for the appropriate sequence in the base sequence file that drives that scenario.
 """
 
 
