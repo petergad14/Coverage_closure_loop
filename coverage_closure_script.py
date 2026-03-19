@@ -5,15 +5,25 @@ import json
 import re
 import shutil
 import git  # From GitPython
+import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
-from google import genai
-from google.genai import types
 from PyPDF2 import PdfReader
+from openai import OpenAI  # Use the OpenAI library
 import sys
-import requests
-import json
-from openai import OpenAI # Use the OpenAI library
+
+
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("auto_cover.log", mode="a"),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 
 # Suppress subprocess cleanup errors on Windows
@@ -22,198 +32,290 @@ if sys.platform == "win32":
     warnings.filterwarnings("ignore")
 
 
-# Helper function for safer subprocess cleanup on Windows
-def safe_subprocess_run(cmd, **kwargs):
-    """Wrapper around subprocess.run that handles Windows cleanup issues gracefully."""
-    try:
-        return subprocess.run(cmd, **kwargs)
-    except Exception as e:
-        print(f"[WARNING] Subprocess error: {e}")
-        return None
+# --- Constants ---
+SUBPROCESS_TIMEOUT = 600  # 10-minute timeout for simulations
+API_MAX_RETRIES = 3
+API_RETRY_DELAY = 10  # seconds
 
 
 class GitManager:
     def __init__(self, repo_path):
         try:
             self.repo = git.Repo(repo_path)
-            print(f"[GIT] Connected to repo at {repo_path}")
+            logger.info(f"Connected to repo at {repo_path}")
         except git.exc.InvalidGitRepositoryError:
-            print("[GIT] Initializing new repository...")
+            logger.info("Initializing new repository...")
             self.repo = git.Repo.init(repo_path)
 
     def commit_and_push(self, iteration, coverage_score):
         try:
-            print(f"[GIT DEBUG] Starting commit_and_push for iteration {iteration}")
-            
+            logger.debug(f"Starting commit_and_push for iteration {iteration}")
+
             # Stage changes (including the updated virtual sequence)
-            print("[GIT DEBUG] Staging all changes...")
             self.repo.git.add(A=True)
-            print("[GIT DEBUG] Changes staged successfully")
-            
+            logger.debug("Changes staged successfully")
+
             # Check if there are changes to commit
             untracked = self.repo.untracked_files
             staged = len(self.repo.index.diff('HEAD')) > 0
-            print(f"[GIT DEBUG] Untracked files: {len(untracked)}, Staged changes: {staged}")
-            
+            logger.debug(f"Untracked files: {len(untracked)}, Staged changes: {staged}")
+
             if not staged and not untracked:
-                print("[GIT WARNING] No changes to commit")
+                logger.warning("No changes to commit")
                 return False
-            
+
             # Create a descriptive commit message
             message = f"AI Update Iteration {iteration}: Coverage reached {coverage_score}%"
-            print(f"[GIT DEBUG] Committing with message: {message}")
-            
-            # Commit locally
             self.repo.index.commit(message)
-            print(f"[GIT] Committed: {message}")
-            
+            logger.info(f"Committed: {message}")
+
             # Check remotes
             remotes = self.repo.remotes
-            print(f"[GIT DEBUG] Available remotes: {[r.name for r in remotes]}")
-            
+            logger.debug(f"Available remotes: {[r.name for r in remotes]}")
+
             if 'origin' not in [r.name for r in remotes]:
-                print("[GIT ERROR] 'origin' remote not found. Available remotes: {}".format([r.name for r in remotes]))
+                logger.error(f"'origin' remote not found. Available remotes: {[r.name for r in remotes]}")
                 return False
-            
-            # Push to origin (ensure you have set up a remote and SSH/Token)
-            print("[GIT DEBUG] Attempting to push to 'origin'...")
+
+            # Push to origin
             origin = self.repo.remote(name='origin')
-            print(f"[GIT DEBUG] Origin URL: {origin.url}")
+            logger.debug(f"Origin URL: {origin.url}")
             origin.push()
-            print("[GIT] Pushed updates to remote.")
+            logger.info("Pushed updates to remote.")
             return True
-            
+
         except git.exc.GitCommandError as ge:
-            print(f"[GIT ERROR] Git command failed: {ge}")
-            print(f"[GIT DEBUG] Command output: {ge.stderr}")
+            logger.error(f"Git command failed: {ge}")
+            logger.debug(f"Command output: {ge.stderr}")
             return False
         except Exception as e:
-            print(f"[GIT ERROR] Failed to update git: {e}")
-            print(f"[GIT DEBUG] Exception type: {type(e).__name__}")
+            logger.error(f"Failed to update git: {e}")
             import traceback
-            print(f"[GIT DEBUG] Traceback: {traceback.format_exc()}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return False
 
 
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
-# API KEY setup
-API_KEY = "" # REPLACE THIS with your actual key
+API_KEY = "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"  # REPLACE THIS with your actual key or use env var
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-MODEL = "moonshotai/kimi-k2:free"
+MODEL = "stepfun/step-3.5-flash:free"
 
 client = OpenAI(
-  base_url="https://openrouter.ai/api/v1",
-  api_key=API_KEY,
+    base_url=OPENROUTER_BASE_URL,
+    api_key=API_KEY,
 )
 
-TARGET_COVERAGE = 100
+TARGET_COVERAGE = 99
 MAX_ITERS = 3
-
-# Project Paths (Based on your screenshots)
-PROJECT_PATH = r"e:\ZC\Graduation Project\creator"
-SPEC_PDF = Path(PROJECT_PATH) / "spec/OS_Creator_Spec.pdf"
-UCDB_FILE = Path(PROJECT_PATH) / "covhtmlreport/coverage.ucdb"
-COVERAGE_REPORT = Path(PROJECT_PATH) / "covhtmlreport/report.txt"
-COMPILE_LIST = Path(PROJECT_PATH) / "compile_files.f"
-
-# Context Files (The AI needs these to write valid code)
-
-SEQ_ITEM_FILE = Path(PROJECT_PATH) / "creator_env/creator_sequence_item.svh"
-BASE_SEQ_FILE = Path(PROJECT_PATH) / "creator_env/creator_sequence.svh" 
-VIRT_SEQ_FILE = Path(PROJECT_PATH) / "creator_env/creator_virtual_sequence.svh"
-SUBSCRIBER_FILE = Path(PROJECT_PATH) / "creator_env/creator_subscriber.svh"
-TEST_BASE_FILE = Path(PROJECT_PATH) / "creator_env/creator_test_base.svh"
-
-
 
 # Token tracking
 token_stats = {
     "total_prompt_tokens": 0,
     "total_response_tokens": 0,
     "total_tokens": 0,
-    "iterations": {}
+    "iterations": {},
 }
+
+
+def setup_paths(project_path):
+    """Initialize all project paths from the given root."""
+    paths = {
+        "project": Path(project_path),
+        "spec_pdf": Path(project_path) / "spec/OS_Creator_Spec.pdf",
+        "ucdb_file": Path(project_path) / "covhtmlreport/coverage.ucdb",
+        "coverage_report": Path(project_path) / "covhtmlreport/report.txt",
+        "compile_list": Path(project_path) / "compile_files.f",
+        "seq_item": Path(project_path) / "creator_env/creator_sequence_item.svh",
+        "base_seq": Path(project_path) / "creator_env/creator_sequence.svh",
+        "virt_seq": Path(project_path) / "creator_env/creator_virtual_sequence.svh",
+        "subscriber": Path(project_path) / "creator_env/creator_subscriber.svh",
+        "test_base": Path(project_path) / "creator_env/creator_test_base.svh",
+    }
+    return paths
+
 
 # ------------------------------
 # CORE LOGIC
 # ------------------------------
 
+def safe_subprocess_run(cmd, stream=False, **kwargs):
+    """Wrapper around subprocess.run with timeout and error handling.
+
+    Args:
+        stream: If True, output is printed live to the terminal (no capture).
+                If False (default), output is captured and returned in result.
+    """
+    kwargs.setdefault("timeout", SUBPROCESS_TIMEOUT)
+    if not stream:
+        kwargs.setdefault("capture_output", True)
+        kwargs.setdefault("text", True)
+    try:
+        result = subprocess.run(cmd, **kwargs)
+        return result
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command timed out after {kwargs['timeout']}s: {cmd}")
+        return None
+    except Exception as e:
+        logger.warning(f"Subprocess error: {e}")
+        return None
+
+
+def read_spec_pdf(pdf_path):
+    """Read and extract text from the specification PDF."""
+    try:
+        reader = PdfReader(str(pdf_path))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        if not text.strip():
+            logger.warning(f"PDF at {pdf_path} produced no extractable text.")
+            return "No text could be extracted from the specification PDF."
+        logger.info(f"Extracted {len(text)} characters from spec PDF ({len(reader.pages)} pages)")
+        return text
+    except FileNotFoundError:
+        logger.error(f"Spec PDF not found: {pdf_path}")
+        return "Specification PDF not found."
+    except Exception as e:
+        logger.error(f"Failed to read spec PDF: {e}")
+        return f"Error reading specification: {e}"
+
+
+def clean_ai_json(content):
+    """Strip markdown code fences from AI-generated JSON if present."""
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+    return content
+
+
 def show_diff_and_confirm(original_file, new_code):
     """Show diff using available tools and wait for user confirmation."""
     import tempfile
     import difflib
-    
-    print("[DEBUG] Preparing diff for user review...")
-    
+
+    logger.debug("Preparing diff for user review...")
+
     # Create temporary file with new code
     with tempfile.NamedTemporaryFile(mode='w', suffix='.svh', delete=False) as tmp:
         tmp.write(new_code)
         tmp_path = tmp.name
-    
-    print(f"[DEBUG] Temporary file created: {tmp_path}")
-    print(f"[DEBUG] Original file: {original_file}")
-    
+
     original_text = Path(original_file).read_text()
-    
+
     # Try various diff tools in order of preference
     diff_tools = [
-        ("VS Code", f'code --diff "{original_file}" "{tmp_path}"', True),  # shell=True for proper quoting
+        ("VS Code", f'code --diff "{original_file}" "{tmp_path}"', True),
         ("WinMerge", ["WinMergeU", str(original_file), tmp_path], False),
         ("Beyond Compare", ["bcomp", str(original_file), tmp_path], False),
         ("Meld", ["meld", str(original_file), tmp_path], False),
     ]
-    
+
     diff_opened = False
     for tool_name, cmd, use_shell in diff_tools:
         try:
-            print(f"[INFO] Attempting to open diff with {tool_name}...")
+            logger.info(f"Attempting to open diff with {tool_name}...")
             if use_shell:
-                print(f"[DEBUG] Executing command: {cmd}")
                 subprocess.run(cmd, shell=True, check=False)
             else:
-                print(f"[DEBUG] Executing command: {cmd}")
                 subprocess.run(cmd, check=False)
-            print(f"[DEBUG] User closed {tool_name} window")
             diff_opened = True
             break
         except FileNotFoundError:
-            print(f"[DEBUG] {tool_name} not found, trying next option...")
+            logger.debug(f"{tool_name} not found, trying next option...")
             continue
         except Exception as e:
-            print(f"[DEBUG] {tool_name} failed: {e}")
+            logger.debug(f"{tool_name} failed: {e}")
             continue
-    
+
     if not diff_opened:
-        print("[WARNING] No GUI diff tool found. Showing text diff instead...")
-        diff = list(difflib.unified_diff(original_text.splitlines(), new_code.splitlines(), lineterm=''))
+        logger.warning("No GUI diff tool found. Showing text diff instead...")
+        diff = list(difflib.unified_diff(
+            original_text.splitlines(), new_code.splitlines(), lineterm=''
+        ))
         if diff:
             print("\n[DIFF] Changes to be applied:")
-            print("\n".join(diff[:50]))  # Show first 50 lines
+            print("\n".join(diff[:50]))
             if len(diff) > 50:
                 print(f"... and {len(diff) - 50} more lines")
         else:
-            print("[INFO] No changes detected")
-    
-    return tmp_path, True
+            logger.info("No changes detected")
 
-def evolve_sequence(iteration, spec_text, cov_text):
+    # Ask for actual user confirmation
+    print("\n[PROMPT] Do you want to apply these changes? (y/n): ", end="")
+    user_choice = input().strip().lower()
+    accepted = user_choice in ('y', 'yes')
+
+    return tmp_path, accepted
+
+
+# --- System Prompt for Coverage Closure AI ---
+SYSTEM_PROMPT = """You are a Senior UVM Verification Engineer specializing in functional coverage closure
+for the PCIe PHY Layer OS Creator module.
+
+## Domain Context
+You are working on the OS (Ordered Set) Creator block of a PCIe Gen1 Physical Layer.
+This block receives requests from the LTSSM FSM to generate ordered sets (TS1, TS2, SKP, FTS, IDLE)
+and serializes them symbol-by-symbol into a Tx OS buffer.
+
+## Your Environment
+- **UVM Testbench**: Multi-agent environment with 3 agents (global, FSM, Tx)
+- **Virtual Sequencer**: `creator_virtual_sequencer` with handles:
+  - `p_sequencer.sequencer_global_h` — drives reset/global signals
+  - `p_sequencer.sequencer_FSM_h` — drives FSM control signals (enable, OS types, symbols)
+  - `p_sequencer.sequencer_Tx_h` — drives Tx buffer signals (buffer full/empty)
+
+## Available Sequences (you may ONLY use these, do NOT create new classes):
+| Sequence Name              | Sequencer Target | Purpose |
+|----------------------------|------------------|---------|
+| `reset_sequence`           | `sequencer_global_h` | Assert/deassert reset |
+| `LIDLE_sequence`           | `sequencer_FSM_h` | Drive L_IDLE ordered set (enable=0) |
+| `TS1_sequence`             | `sequencer_FSM_h` | Full TS1 OS with PAD→Link/Lane transition |
+| `TS1_intrpt_sequence`      | `sequencer_FSM_h` | TS1 with mid-stream interrupt (enable/stateChange/resetTS) |
+| `TS2_sequence`             | `sequencer_FSM_h` | Full TS2 OS with PAD→Link/Lane transition |
+| `TS2_intrpt_sequence`      | `sequencer_FSM_h` | TS2 with mid-stream interrupt |
+| `SKP_sequence`             | `sequencer_FSM_h` | Skip ordered set (COM+3×SKP) |
+| `FTS_sequence`             | `sequencer_FSM_h` | Fast Training Sequence (COM+3×FTS) |
+| `IDLE_sequence`            | `sequencer_FSM_h` | Electrical Idle ordered set |
+| `OS_Buffer_empty_sequence` | `sequencer_Tx_h` | Buffer not full |
+| `OS_Buffer_full_sequence`  | `sequencer_Tx_h` | Buffer full (backpressure) |
+
+## Covergroup Bins to Know About
+The subscriber samples these key coverpoints:
+- `i_enable_cp`: enable / no_enable
+- `i_LTSSM_stateChange_cp`: state_change / no_state_change
+- `i_reset_TS_count_cp`: reset_TS_count / no_reset_TS_count
+- `i_OSreqNum_cp`: reqNum values 0, 1, 16, 24
+- `i_OScreatorTypes_cp`: other_OS (2'b00), TS_OS (2'b01), IDLE_OS (2'b10)
+- `i_OScreatorSymbol0-15_cp`: various symbol bins (COM, PAD, Link, Lane, SKP, FTS, etc.)
+- `i_Tx_OSbufferFull_cp`: bufferFull / bufferNotFull
+- `o_OScreator_Ack_cp`: Ack / noAck
+- `o_OScreator_Data_cp`: 12 data combination bins
+- `o_OScreator_valid_cp`: valid / invalid
+
+## Critical Rules
+1. ONLY modify the `body()` task of `creator_virtual_sequence`. Keep the class name and `pre_body()` EXACTLY as-is.
+2. NEVER define new sequence classes — only instantiate and start the ones listed above.
+3. Each sequence's `pre_body()` creates its transaction — always call `seq.start(sequencer)` (which invokes `pre_body` automatically).
+4. Use `repeat(N)` around sequence starts to control how many ordered sets are generated.
+5. To hit `i_OSreqNum_cp` bins, the reqNum field is randomized inside the sequences — run enough iterations for randomization to cover all bins.
+6. To hit interrupt-related bins (stateChange, resetTS), use `TS1_intrpt_sequence` / `TS2_intrpt_sequence`.
+7. To hit bufferFull, start `OS_Buffer_full_sequence` BEFORE FSM sequences that generate data.
+8. Always start with `reset_sequence` on `sequencer_global_h`.
+9. The output must be a complete, compilable `.svh` file — include all `include` guards, class header, pre_body, and body.
+10. Use proper SystemVerilog syntax. Do not use pseudo-code or abbreviations.
+"""
+
+
+def evolve_sequence(iteration, spec_text, cov_text, paths):
     """Asks AI Model to rewrite the body of the virtual sequence."""
-    
-    current_vseq_code = VIRT_SEQ_FILE.read_text()
-    # 1. Load Context (The "Vocabulary" of your UVM env)
-    item_code = SEQ_ITEM_FILE.read_text()
-    seq_code = BASE_SEQ_FILE.read_text()
-    subscriber_code = SUBSCRIBER_FILE.read_text()
-    base_test_code = TEST_BASE_FILE.read_text()
-    
+
+    current_vseq_code = paths["virt_seq"].read_text()
+    item_code = paths["seq_item"].read_text()
+    seq_code = paths["base_seq"].read_text()
+    subscriber_code = paths["subscriber"].read_text()
+
     prompt = f"""
-    <role>
-    You are a Senior UVM Verification Engineer specializing in Coverage Closure.
-    Your task is to analyze functional coverage holes and evolve the stimulus to hit them.
-    </role>
-    
     <context>
     <specification_summary>
     {spec_text}
@@ -236,126 +338,148 @@ def evolve_sequence(iteration, spec_text, cov_text):
     </subscriber_covergroups>
     </context>
 
-    <coverage_report_feedback>
+    <coverage_report_iteration_{iteration}>
     {cov_text}
-    </coverage_report_feedback>
+    </coverage_report_iteration_{iteration}>
 
-    <task_instructions>
-    1. Analyze the <coverage_report_feedback> to identify the specific variable values or bins that are 'UNHIT'.
-    2. Cross-reference these bins with the <uvm_transaction_item> to find which fields control that logic.
-    3. Review the <specification_summary> to understand the intended functionality related to those coverage holes.
-    4. REWRITE the `body()` task of the virtual sequence to generate directed stimulus for those holes.
-    5. Ensure you use the existing sequencer handles and do not change the class name.
-    6. Make sure to only add sequences to the available virtual sequence; do not create new classes.
-    7. Make sure the code is complete and compilable.
-    8. Keep the code style consistent with UVM best practices.
-    9. Output the full, updated code of the file.
-    </task_instructions>
+    <task>
+    Analyze the coverage report above. For every bin marked UNHIT or with 0 hits:
+    1. Identify which `creator_sequence_item` field maps to that bin.
+    2. Determine which available sequence drives that field to the needed value.
+    3. Add or adjust sequence starts in `body()` so the DUT exercises that exact scenario.
 
-    <output_format_requirement>
+    Think step-by-step:
+    - List each UNHIT bin and the field/value it needs.
+    - Map each to a sequence + sequencer.
+    - Write the updated `body()` task with enough repetitions and ordering to cover all holes.
+    - If a bin requires backpressure (bufferFull=1), run `OS_Buffer_full_sequence` before the FSM sequence.
+    - If a bin requires interrupts, use the `_intrpt_sequence` variants.
+    </task>
+
+    <output_format>
     Return ONLY a JSON object with this exact structure:
     {{
-        "reasoning": "A brief explanation of which coverage holes you are targeting and how your new code hits them.",
-        "updated_code": "// Full SystemVerilog Code here..."
+        "reasoning": "List each UNHIT bin you found, the field it maps to, and which sequence you added/modified to cover it.",
+        "updated_code": "// Complete, compilable creator_virtual_sequence.svh file content"
     }}
-    </output_format_requirement>
+    Do NOT wrap the JSON in markdown code fences. Return raw JSON only.
+    </output_format>
     """
 
-    print(f"[AI] Evolving Virtual Sequence (Iteration {iteration})...")
-    try:
-        response = client.chat.completions.create(
-          model=MODEL,
-          messages=[
-            {"role": "system", "content": "You are a UVM Expert."},
-            {"role": "user", "content": prompt}
-          ],
-          # OpenRouter supports JSON mode for most top-tier models
-          response_format={ "type": "json_object" } 
-        )
+    logger.info(f"Evolving Virtual Sequence (Iteration {iteration})...")
 
-        # Accessing content and token usage
-        content = response.choices[0].message.content
-        usage = response.usage
-        
-        print(f"[TOKEN USAGE] Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens}")
-        print(f"[COST] Approx: ${calculate_openrouter_cost(usage, MODEL):.6f}")
-        
-        # Return both the parsed code and token information
-        result = json.loads(content)
-        result['_token_info'] = {
-            'prompt_tokens': usage.prompt_tokens,
-            'response_tokens': usage.completion_tokens,
-            'total_tokens': usage.total_tokens
-        }
-        return result
-    except Exception as e:
-        print(f"[ERROR] AI Update failed: {e}")
-        return None
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+
+            content = response.choices[0].message.content
+            usage = response.usage
+
+            logger.info(f"Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens}")
+            logger.info(f"Approx cost: ${calculate_openrouter_cost(usage, MODEL):.6f}")
+
+            # Clean markdown fences and parse JSON
+            content = clean_ai_json(content)
+            result = json.loads(content)
+
+            result['_token_info'] = {
+                'prompt_tokens': usage.prompt_tokens,
+                'response_tokens': usage.completion_tokens,
+                'total_tokens': usage.total_tokens,
+            }
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse AI response as JSON (attempt {attempt}): {e}")
+            if attempt < API_MAX_RETRIES:
+                logger.info(f"Retrying in {API_RETRY_DELAY}s...")
+                time.sleep(API_RETRY_DELAY)
+        except Exception as e:
+            logger.error(f"AI API call failed (attempt {attempt}): {e}")
+            if attempt < API_MAX_RETRIES:
+                logger.info(f"Retrying in {API_RETRY_DELAY}s...")
+                time.sleep(API_RETRY_DELAY)
+
+    logger.error("All API retry attempts exhausted.")
+    return None
+
 
 def calculate_openrouter_cost(usage, model_name):
-    """
-    Optional: OpenRouter provides pricing in their model list, 
-    but for a quick estimate for Gemini Flash on OpenRouter:
-    """
+    """Estimate cost based on OpenRouter pricing."""
     p_rate = 0.10 / 1_000_000
     c_rate = 0.40 / 1_000_000
     return (usage.prompt_tokens * p_rate) + (usage.completion_tokens * c_rate)
 
-def main():
-    # 0. Backup original sequence
-    backup_file = VIRT_SEQ_FILE.with_suffix(".svh.bak")
-    if not backup_file.exists():
-        shutil.copy(VIRT_SEQ_FILE, backup_file)
-        print(f"[INFO] Created backup: {backup_file}")
 
-    git_handler = GitManager(PROJECT_PATH)
-    
-    # Initial baseline simulation (before loop)
-    print("[STEP] Running Initial Baseline Simulation...")
-    print(f"[DEBUG] Simulation directory: {PROJECT_PATH}")
-    print("[DEBUG] ========== INITIAL SIMULATION OUTPUT START ==========")
-    sim_result = subprocess.run(
-        ["vsim", "-c", "-do", "cov.do"], 
-        cwd=PROJECT_PATH
+def main(project_path):
+    paths = setup_paths(project_path)
+
+    # 0. Backup original sequence
+    backup_file = paths["virt_seq"].with_suffix(".svh.bak")
+    if not backup_file.exists():
+        shutil.copy(paths["virt_seq"], backup_file)
+        logger.info(f"Created backup: {backup_file}")
+
+    git_handler = GitManager(project_path)
+
+    # Read the specification PDF
+    logger.info("Reading specification PDF...")
+    spec_text = read_spec_pdf(paths["spec_pdf"])
+
+    # Initial compile step
+    logger.info("Running initial compilation...")
+    print("" + "=" * 60)
+    print("[COMPILE OUTPUT]")
+    print("=" * 60)
+    compile_result = safe_subprocess_run(
+        ["vlog", "-f", "compile_files.f"], cwd=project_path, stream=True
     )
-    print("[DEBUG] ========== INITIAL SIMULATION OUTPUT END ==========")
-    print(f"[DEBUG] Simulation return code: {sim_result.returncode if sim_result else 'Unknown'}")
-    if sim_result and sim_result.returncode != 0:
-        print(f"[WARNING] Initial simulation failed with return code: {sim_result.returncode}")
+    print("=" * 60)
+    if compile_result is None or compile_result.returncode != 0:
+        logger.error("Initial compilation failed. Please fix compile errors first.")
+        return
+
+    # Initial baseline simulation
+    logger.info("Running initial baseline simulation...")
+    print("\n" + "=" * 60)
+    print("[SIMULATION OUTPUT - Baseline]")
+    print("=" * 60)
+    sim_result = safe_subprocess_run(
+        ["vsim", "-c", "-do", "cov.do"], cwd=project_path, stream=True
+    )
+    print("=" * 60)
+    if sim_result is None or sim_result.returncode != 0:
+        logger.error("Initial simulation failed.")
         return
 
     # Get baseline coverage
-    print("[DEBUG] Generating initial coverage report...")
-    vcover_cmd = f'vcover report "{UCDB_FILE}" -details -output "{COVERAGE_REPORT}"'
-    print(f"[DEBUG] vcover command: {vcover_cmd}")
-    cov_result = subprocess.run(
-        vcover_cmd,
-        cwd=PROJECT_PATH,
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    print(f"[DEBUG] vcover return code: {cov_result.returncode}")
-    if cov_result.returncode != 0:
-        print(f"[WARNING] vcover stderr: {cov_result.stderr}")
+    logger.info("Generating initial coverage report...")
+    vcover_cmd = f'vcover report "{paths["ucdb_file"]}" -details -output "{paths["coverage_report"]}"'
+    cov_result = safe_subprocess_run(vcover_cmd, cwd=project_path, shell=True)
+    if cov_result is None or cov_result.returncode != 0:
+        logger.error("Failed to generate baseline coverage report.")
         return
-    
-    print(f"[DEBUG] Reading coverage report from: {COVERAGE_REPORT}")
-    cov_text = COVERAGE_REPORT.read_text()
+
+    cov_text = paths["coverage_report"].read_text()
     match = re.search(r"TOTAL COVERGROUP COVERAGE\s*:\s*([\d\.]+)", cov_text)
     baseline_cov = float(match.group(1)) if match else 0.0
-    print(f"[INFO] Baseline Coverage: {baseline_cov}%")
-    
+    logger.info(f"Baseline Coverage: {baseline_cov}%")
+
     # Main iteration loop
     for i in range(1, MAX_ITERS + 1):
-        print(f"\n--- Iteration {i} ---")
-        
-        spec_text = "See attached PDF context" # Add PDF reading logic here if needed
-        
+        logger.info(f"\n--- Iteration {i} ---")
+
         # 1. AI Update with diff preview
-        print("[STEP] Generating AI improvements...")
-        result = evolve_sequence(i, spec_text, cov_text)
-        
+        logger.info("Generating AI improvements...")
+        result = evolve_sequence(i, spec_text, cov_text, paths)
+
         # Track tokens from this iteration
         if result and '_token_info' in result:
             token_info = result['_token_info']
@@ -363,95 +487,102 @@ def main():
             token_stats["total_prompt_tokens"] += token_info['prompt_tokens']
             token_stats["total_response_tokens"] += token_info['response_tokens']
             token_stats["total_tokens"] += token_info['total_tokens']
-        
+
         if result and "updated_code" in result:
-            print("\n[AI] Changes generated successfully.")
-            print("[INFO] Opening diff viewer for review...")
-            tmp_file, accepted = show_diff_and_confirm(VIRT_SEQ_FILE, result["updated_code"])
-            
-            print("\n[PROMPT] Do you want to implement these changes? (y/n): ", end="")
-            user_choice = input().strip().lower()
-            
-            if user_choice == 'y' or user_choice == 'yes':
+            logger.info("AI changes generated successfully.")
+            logger.info(f"AI reasoning: {result.get('reasoning', 'N/A')}")
+
+            tmp_file, accepted = show_diff_and_confirm(paths["virt_seq"], result["updated_code"])
+
+            if accepted:
                 # Overwrite the actual virtual sequence file
-                VIRT_SEQ_FILE.write_text(result["updated_code"])
-                print("[INFO] Virtual sequence updated.")
-                
-                print("[INFO] Recompiling...")
-                # 4. Recompile
-                compile_result = subprocess.run(["vlog", "-f", "compile_files.f"], cwd=PROJECT_PATH, capture_output=True, text=True)
-                print(f"[DEBUG] Compilation return code: {compile_result.returncode}")
-                if compile_result.returncode != 0:
-                    print(f"[WARNING] Compilation failed: {compile_result.stderr}")
+                paths["virt_seq"].write_text(result["updated_code"])
+                logger.info("Virtual sequence updated.")
+
+                # Recompile
+                logger.info("Recompiling...")
+                print("\n" + "=" * 60)
+                print(f"[COMPILE OUTPUT - Iteration {i}]")
+                print("=" * 60)
+                compile_result = safe_subprocess_run(
+                    ["vlog", "-f", "compile_files.f"], cwd=project_path, stream=True
+                )
+                print("=" * 60)
+                if compile_result is None or compile_result.returncode != 0:
+                    logger.error("Compilation failed.")
                 else:
-                    print("[STEP] Compilation successful. Running simulation with updated code...")
-                    print("[DEBUG] ========== POST-UPDATE SIMULATION OUTPUT START ==========")
-                    sim_result_post = subprocess.run(
-                        ["vsim", "-c", "-do", "cov.do"], 
-                        cwd=PROJECT_PATH
+                    logger.info("Compilation successful. Running simulation...")
+                    print("\n" + "=" * 60)
+                    print(f"[SIMULATION OUTPUT - Iteration {i}]")
+                    print("=" * 60)
+                    sim_result_post = safe_subprocess_run(
+                        ["vsim", "-c", "-do", "cov.do"], cwd=project_path, stream=True
                     )
-                    print("[DEBUG] ========== POST-UPDATE SIMULATION OUTPUT END ==========")
-                    print(f"[DEBUG] Post-update simulation return code: {sim_result_post.returncode if sim_result_post else 'Unknown'}")
-                    
+                    print("=" * 60)
+
                     if sim_result_post and sim_result_post.returncode == 0:
-                        print("[STEP] Generating coverage report for updated code...")
-                        vcover_cmd_post = f'vcover report "{UCDB_FILE}" -details -output "{COVERAGE_REPORT}"'
-                        print(f"[DEBUG] vcover command: {vcover_cmd_post}")
-                        cov_result_post = subprocess.run(
-                            vcover_cmd_post,
-                            cwd=PROJECT_PATH,
-                            shell=True,
-                            capture_output=True,
-                            text=True
+                        logger.info("Generating coverage report for updated code...")
+                        vcover_cmd_post = f'vcover report "{paths["ucdb_file"]}" -details -output "{paths["coverage_report"]}"'
+                        cov_result_post = safe_subprocess_run(
+                            vcover_cmd_post, cwd=project_path, shell=True
                         )
-                        print(f"[DEBUG] vcover return code: {cov_result_post.returncode}")
-                        if cov_result_post.returncode == 0:
-                            cov_text_post = COVERAGE_REPORT.read_text()
-                            match_post = re.search(r"TOTAL COVERGROUP COVERAGE\s*:\s*([\d\.]+)", cov_text_post)
+                        if cov_result_post and cov_result_post.returncode == 0:
+                            cov_text = paths["coverage_report"].read_text()  # Update for next iteration!
+                            match_post = re.search(r"TOTAL COVERGROUP COVERAGE\s*:\s*([\d\.]+)", cov_text)
                             new_cov = float(match_post.group(1)) if match_post else 0.0
-                            print(f"[INFO] Coverage after updates: {new_cov}%")
-                            print(f"[INFO] Coverage improvement: {new_cov - baseline_cov:+.2f}%")
-                            
-                            # Now commit and push with new coverage numbers
-                            print(f"[DEBUG] Calling commit_and_push with iteration={i}, new coverage={new_cov}%")
+                            logger.info(f"Coverage after updates: {new_cov}%")
+                            logger.info(f"Coverage improvement: {new_cov - baseline_cov:+.2f}%")
+                            baseline_cov = new_cov  # Update baseline for next iteration
+
+                            # Commit and push
                             push_success = git_handler.commit_and_push(i, new_cov)
-                            print(f"[DEBUG] Git push result: {push_success}")
-                            
+                            logger.debug(f"Git push result: {push_success}")
+
                             if new_cov >= TARGET_COVERAGE:
-                                print(f"[SUCCESS] Target coverage of {TARGET_COVERAGE}% reached!")
+                                logger.info(f"Target coverage of {TARGET_COVERAGE}% reached!")
                                 break
                         else:
-                            print(f"[WARNING] Post-update vcover failed: {cov_result_post.stderr}")
+                            logger.error("Post-update vcover failed.")
                     else:
-                        print("[WARNING] Post-update simulation failed")
+                        logger.error("Post-update simulation failed.")
             else:
-                print("[INFO] User rejected changes. Skipping update for this iteration.")
-            
+                logger.info("User rejected changes. Skipping update for this iteration.")
+
             # Cleanup temporary file
             try:
                 Path(tmp_file).unlink()
-                print(f"[DEBUG] Cleaned up temporary file: {tmp_file}")
-            except:
+            except Exception:
                 pass
         else:
-            print("[WARNING] AI failed to generate updated code")
-        
+            logger.warning("AI failed to generate updated code.")
+
         time.sleep(5)
 
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="AI-driven UVM coverage closure automation."
+    )
+    parser.add_argument(
+        "--project-path",
+        default=r"e:\ZC\Graduation Project\creator",
+        help="Root path of the UVM project (default: current project path)",
+    )
+    args = parser.parse_args()
+
     try:
-        main()
+        main(args.project_path)
     except KeyboardInterrupt:
-        print("\n[INFO] Script interrupted by user.")
+        logger.info("Script interrupted by user.")
     except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         # Print token usage summary
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("[TOKEN USAGE SUMMARY]")
-        print("="*60)
+        print("=" * 60)
         if token_stats["iterations"]:
             for iter_num in sorted(token_stats["iterations"].keys()):
                 iter_tokens = token_stats["iterations"][iter_num]
@@ -459,14 +590,13 @@ if __name__ == "__main__":
                 print(f"   - Prompt Tokens: {iter_tokens['prompt_tokens']}")
                 print(f"   - Response Tokens: {iter_tokens['response_tokens']}")
                 print(f"   - Total: {iter_tokens['total_tokens']}")
-        
+
         print("\n[OVERALL STATISTICS]")
         print(f"Total Prompt Tokens: {token_stats['total_prompt_tokens']}")
         print(f"Total Response Tokens: {token_stats['total_response_tokens']}")
         print(f"Total Tokens Used: {token_stats['total_tokens']}")
-        print("="*60)
-        
-        print("\n[INFO] Cleaning up and exiting...")
-        # Force garbage collection to ensure subprocess handles are closed
+        print("=" * 60)
+
+        logger.info("Cleaning up and exiting...")
         import gc
         gc.collect()
