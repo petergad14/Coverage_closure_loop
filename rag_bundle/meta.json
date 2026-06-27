@@ -1,0 +1,9 @@
+{
+  "embed_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "n_chunks": 816,
+  "chunk_size": 800,
+  "chunk_overlap": 150,
+  "sources": [
+    "AXI4_specification.pdf"
+  ]
+}
